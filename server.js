@@ -8,9 +8,10 @@ const app = express();
 
 // --- CORS Setup ---
 const allowedOrigins = [
-  "http://localhost:5173",          // Local React/Vite
-  "http://localhost:3000",          // Local fallback
-  process.env.FRONTEND_URL          // Render Dashboard mein ye URL add karein
+  "http://localhost:5173",
+  "http://localhost:3000",
+  "https://gbbilling-ae817.web.app",   // ← hardcode bhi rakho backup ke liye
+  process.env.FRONTEND_URL,
 ];
 
 app.use(cors({
