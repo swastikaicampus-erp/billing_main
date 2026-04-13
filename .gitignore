@@ -4,4 +4,3 @@ dist/
 build/
 logs/
 *.log
-uploads/
