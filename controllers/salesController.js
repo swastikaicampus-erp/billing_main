@@ -1,6 +1,7 @@
-const Sale    = require("../models/Sale");
+const mongoose = require("mongoose");
+const Sale = require("../models/Sale");
 const Product = require("../models/Product");
-const Counter = require("../models/Counter"); // invoice number ke liye
+const Customer = require("../models/Customer");
 
 // ─── Helper: Invoice Number Generate ──────────────────────────────
 // models/Counter.js bhi banana hoga (neeche diya hai)
@@ -14,135 +15,141 @@ async function generateInvoiceNumber(shopId) {
   return `INV-${num}`;
 }
 
-// ─── CREATE SALE ───────────────────────────────────────────────────
+
+
 exports.createSale = async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
   try {
+    const shopId = req.user.shopId;
     const {
-      customerName,
-      customerPhone,
-      customer,
-      items,             // array of { productId, quantity, discount }
-      discountType,
-      discountValue,
-      paymentMode,
-      amountPaid,
-      notes,
+      customerName, customerPhone,
+      items, discountType, discountValue,
+      paymentMode, amountPaid, notes,
     } = req.body;
 
-    if (!items || items.length === 0) {
-      return res.status(400).json({ success: false, message: "Koi item nahi hai bill mein" });
+    // ── 1. Customer resolve karo ──────────────────────────────────
+    let customerId = null;
+
+    if (customerPhone) {
+      // Phone se dhundho
+      let customer = await Customer.findOne({ shopId, phone: customerPhone }).session(session);
+
+      if (!customer) {
+        // Naya customer banao
+        customer = await Customer.create([{
+          shopId,
+          name: customerName || "Walk-in Customer",
+          phone: customerPhone,
+        }], { session });
+        customer = customer[0];
+      } else if (customerName && customer.name !== customerName) {
+        // Name update karo agar alag hai
+        customer.name = customerName;
+        await customer.save({ session });
+      }
+
+      customerId = customer._id;
     }
 
-    // ─── Stock check + item rows build ───
-    let subtotal     = 0;
-    let totalTax     = 0;
-    const saleItems  = [];
+    // ── 2. Items validate & calculate karo ───────────────────────
+    let subtotal = 0;
+    let totalTax = 0;
+    const saleItems = [];
 
     for (const item of items) {
-      const product = await Product.findOne({
-        _id:    item.productId,
-        shopId: req.user.shopId,
-        isActive: true,
-      }).populate("unit tax");
-
-      if (!product) {
-        return res.status(404).json({
-          success: false,
-          message: `Product not found: ${item.productId}`,
-        });
-      }
-
+      const product = await Product.findOne({ _id: item.productId, shopId }).session(session);
+      if (!product) throw new Error(`Product not found: ${item.productId}`);
       if (product.openingStock < item.quantity) {
-        return res.status(400).json({
-          success: false,
-          message: `Insufficient stock for: ${product.name} (available: ${product.openingStock})`,
-        });
+        throw new Error(`Insufficient stock for: ${product.name}`);
       }
 
-      const qty         = Number(item.quantity);
-      const price       = product.sellingPrice;
-      const itemDisc    = Number(item.discount || 0);           // per-item discount %
-      const taxPercent  = product.tax?.percent || 0;
+      const priceAfterDisc = product.sellingPrice * (1 - (item.discount || 0) / 100);
+      const taxAmt = (priceAfterDisc * (product.tax?.percent || 0)) / 100;
+      const lineTotal = (priceAfterDisc + taxAmt) * item.quantity;
 
-      const priceAfterDiscount = price * (1 - itemDisc / 100);
-      const taxAmount          = (priceAfterDiscount * taxPercent) / 100;
-      const itemSubtotal       = (priceAfterDiscount + taxAmount) * qty;
-
-      subtotal  += priceAfterDiscount * qty;
-      totalTax  += taxAmount * qty;
+      subtotal += priceAfterDisc * item.quantity;
+      totalTax += taxAmt * item.quantity;
 
       saleItems.push({
-        product:      product._id,
-        productName:  product.name,
-        itemCode:     product.itemCode || "",
-        quantity:     qty,
-        unit:         product.unit?.name || "",
-        purchasePrice:product.purchasePrice,
-        sellingPrice: price,
-        mrp:          product.mrp,
-        discount:     itemDisc,
-        taxPercent,
-        taxAmount:    taxAmount * qty,
-        subtotal:     itemSubtotal,
+        product: product._id,
+        productName: product.name,
+        itemCode: product.itemCode,
+        quantity: item.quantity,
+        sellingPrice: product.sellingPrice,
+        discount: item.discount || 0,
+        taxPercent: product.tax?.percent || 0,
+        subtotal: lineTotal,
+        unit: product.unit?.name || "",
       });
+
+      // Stock ghatao
+      product.openingStock -= item.quantity;
+      await product.save({ session });
     }
 
-    // ─── Bill-level discount ───
-    let discountAmount = 0;
-    if (discountType === "percent") {
-      discountAmount = (subtotal * Number(discountValue || 0)) / 100;
-    } else {
-      discountAmount = Number(discountValue || 0);
-    }
+    // ── 3. Bill discount & totals ─────────────────────────────────
+    const discountAmount =
+      discountType === "percent"
+        ? (subtotal * (discountValue || 0)) / 100
+        : (discountValue || 0);
 
-    const grandTotal   = subtotal + totalTax - discountAmount;
-    const paid         = Number(amountPaid || grandTotal);
-    const changeAmount = Math.max(0, paid - grandTotal);
-    const dueAmount    = Math.max(0, grandTotal - paid);
+    const grandTotal = Math.max(0, subtotal + totalTax - discountAmount);
+    const paid = Number(amountPaid) || grandTotal;
+    const dueAmount = Math.max(0, grandTotal - paid);
 
-    const status = dueAmount > 0
-      ? dueAmount === grandTotal ? "Unpaid" : "Partial"
-      : "Paid";
+    // ── 4. Invoice number generate karo ──────────────────────────
+    const count = await Sale.countDocuments({ shopId }).session(session);
+    const invoiceNo = `INV-${String(count + 1).padStart(5, "0")}`;
 
-    // ─── Invoice number ───
-    const invoiceNumber = await generateInvoiceNumber(req.user.shopId);
-
-    // ─── Save sale ───
-    const sale = await Sale.create({
-      shopId:        req.user.shopId,
-      invoiceNumber,
-      customer:      customer || null,
-      customerName:  customerName || "Walk-in Customer",
-      customerPhone: customerPhone || "",
-      items:         saleItems,
+    // ── 5. Sale save karo ─────────────────────────────────────────
+    const [sale] = await Sale.create([{
+      shopId,
+      invoiceNo,
+      customer: customerId,
+      customerName: customerName || "Walk-in Customer",
+      customerPhone,
+      items: saleItems,
       subtotal,
-      discountType:  discountType || "flat",
-      discountValue: Number(discountValue || 0),
+      totalTax,
+      discountType,
+      discountValue: discountValue || 0,
       discountAmount,
-      taxAmount:     totalTax,
       grandTotal,
-      paymentMode:   paymentMode || "Cash",
-      amountPaid:    paid,
-      changeAmount,
+      paymentMode,
+      amountPaid: paid,
       dueAmount,
-      status,
-      notes:         notes || "",
-      createdBy:     req.user.id,
-    });
+      notes,
+      status: "Completed",
+    }], { session });
 
-    // ─── Stock deduct ───
-    for (const item of items) {
-      await Product.findByIdAndUpdate(item.productId, {
-        $inc: { openingStock: -Number(item.quantity) },
-      });
+    // ── 6. Customer ka due update karo ────────────────────────────
+    if (customerId && dueAmount > 0) {
+      await Customer.findByIdAndUpdate(
+        customerId,
+        {
+          $inc: {
+            totalDue: dueAmount,
+            totalPaid: paid,
+          },
+        },
+        { session }
+      );
+    } else if (customerId && paid > 0) {
+      await Customer.findByIdAndUpdate(
+        customerId,
+        { $inc: { totalPaid: paid } },
+        { session }
+      );
     }
 
-    res.status(201).json({ success: true, message: "Sale created", sale });
-  } catch (error) {
-    if (error.code === 11000) {
-      return res.status(400).json({ success: false, message: "Invoice number conflict, retry karo" });
-    }
-    res.status(500).json({ success: false, message: error.message });
+    await session.commitTransaction();
+    res.status(201).json({ success: true, sale });
+  } catch (err) {
+    await session.abortTransaction();
+    res.status(500).json({ success: false, message: err.message });
+  } finally {
+    session.endSession();
   }
 };
 
@@ -153,24 +160,24 @@ exports.getSales = async (req, res) => {
 
     const filter = { shopId: req.user.shopId };
 
-    if (status)      filter.status      = status;
+    if (status) filter.status = status;
     if (paymentMode) filter.paymentMode = paymentMode;
 
     if (from || to) {
       filter.createdAt = {};
       if (from) filter.createdAt.$gte = new Date(from);
-      if (to)   filter.createdAt.$lte = new Date(new Date(to).setHours(23, 59, 59));
+      if (to) filter.createdAt.$lte = new Date(new Date(to).setHours(23, 59, 59));
     }
 
     if (search) {
       filter.$or = [
         { invoiceNumber: { $regex: search, $options: "i" } },
-        { customerName:  { $regex: search, $options: "i" } },
+        { customerName: { $regex: search, $options: "i" } },
         { customerPhone: { $regex: search, $options: "i" } },
       ];
     }
 
-    const skip  = (Number(page) - 1) * Number(limit);
+    const skip = (Number(page) - 1) * Number(limit);
     const total = await Sale.countDocuments(filter);
 
     const sales = await Sale.find(filter)
@@ -182,8 +189,8 @@ exports.getSales = async (req, res) => {
     res.json({
       success: true,
       total,
-      page:    Number(page),
-      pages:   Math.ceil(total / Number(limit)),
+      page: Number(page),
+      pages: Math.ceil(total / Number(limit)),
       sales,
     });
   } catch (error) {
@@ -195,7 +202,7 @@ exports.getSales = async (req, res) => {
 exports.getSale = async (req, res) => {
   try {
     const sale = await Sale.findOne({
-      _id:    req.params.id,
+      _id: req.params.id,
       shopId: req.user.shopId,
     }).populate("customer", "name phone address");
 
@@ -213,7 +220,7 @@ exports.getSale = async (req, res) => {
 exports.cancelSale = async (req, res) => {
   try {
     const sale = await Sale.findOne({
-      _id:    req.params.id,
+      _id: req.params.id,
       shopId: req.user.shopId,
     });
 
