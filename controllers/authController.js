@@ -1,63 +1,58 @@
-const User = require("../models/UserStocks");
-const Shop = require("../models/Shop");
-const jwt  = require("jsonwebtoken");
+const User   = require("../models/UserStocks");
+const Shop   = require("../models/Shop");
+const jwt    = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
 
 exports.login = async (req, res) => {
   try {
-    const { email, loginId, password } = req.body;
+    const { email, password } = req.body;
 
-    if (!password || (!email && !loginId)) {
+    if (!email || !password) {
       return res.status(400).json({
         success: false,
-        message: "Email/LoginId aur password required hai",
+        message: "Email aur password required hai",
       });
     }
 
-    let user = null;
+    const identifier = email.toLowerCase().trim();
 
-    // ✅ Case 1 — Super Admin: email se login
-    if (email) {
-      user = await User.findOne({ email: email.toLowerCase().trim() });
-    }
-
-    // ✅ Case 2 — Shop: loginId se login
-    if (loginId) {
-      // Shop dhundo loginId se
-      const shop = await Shop.findOne({ loginId: loginId.trim() });
-
-      if (!shop) {
-        return res.status(401).json({ success: false, message: "Invalid credentials" });
-      }
-
-      // Shop active hai?
-      if (!shop.isActive) {
-        return res.status(403).json({ success: false, message: "Shop deactivated hai" });
-      }
-
-      // Shop ka password check
-      const shopPassMatch = await bcrypt.compare(password, shop.password);
-      if (!shopPassMatch) {
-        return res.status(401).json({ success: false, message: "Invalid credentials" });
-      }
-
-      // Shop ka user dhundo
-      user = await User.findOne({ shopId: shop._id, role: "admin" });
-    }
+    // ── Step 1: User dhundo ──────────────────────────────────────────────────
+    const user = await User.findOne({ email: identifier });
 
     if (!user) {
       return res.status(401).json({ success: false, message: "Invalid credentials" });
     }
 
-    // Email login ke liye password check
-    if (email) {
-      const isMatch = await bcrypt.compare(password, user.password);
-      if (!isMatch) {
+    // ── Step 2: Role ke hisaab se password check ─────────────────────────────
+    let isMatch = false;
+
+    if (user.role === "super_admin") {
+      // ✅ Super admin — password User model mein hashed hai
+      isMatch = await bcrypt.compare(password, user.password);
+
+    } else {
+      // ✅ Shop admin/staff — password Shop model mein hashed hai
+      const shop = await Shop.findById(user.shopId).select("+password");
+
+      if (!shop) {
         return res.status(401).json({ success: false, message: "Invalid credentials" });
       }
+
+      if (!shop.isActive) {
+        return res.status(403).json({
+          success: false,
+          message: "Shop deactivated hai. Support se contact karo.",
+        });
+      }
+
+      isMatch = await bcrypt.compare(password, shop.password);
     }
 
-    // ✅ Token mein id + role + shopId teeno
+    if (!isMatch) {
+      return res.status(401).json({ success: false, message: "Invalid credentials" });
+    }
+
+    // ── Step 3: Token banao ───────────────────────────────────────────────────
     const token = jwt.sign(
       {
         id:     user._id,

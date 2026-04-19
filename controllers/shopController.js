@@ -1,99 +1,113 @@
-const Shop = require("../models/Shop");
-const User = require("../models/UserStocks");
+const crypto = require("crypto");
 const bcrypt = require("bcryptjs");
+const Shop   = require("../models/Shop");
+const User   = require("../models/UserStocks");
 
+// ── Encryption helpers ────────────────────────────────────────────────────────
+const ALGO = "aes-256-cbc";
+const KEY  = Buffer.from(
+  (process.env.ENCRYPTION_KEY || "12345678901234567890123456789012").slice(0, 32)
+);
+
+function encryptPassword(plain) {
+  const iv        = crypto.randomBytes(16);
+  const cipher    = crypto.createCipheriv(ALGO, KEY, iv);
+  const encrypted = Buffer.concat([cipher.update(plain, "utf8"), cipher.final()]);
+  return iv.toString("hex") + ":" + encrypted.toString("hex");
+}
+
+// ── Create Shop ───────────────────────────────────────────────────────────────
 exports.createShop = async (req, res) => {
   try {
     const { shopName, ownerName, email, phone, address, gstNo } = req.body;
 
-    // 1. Validation log
     if (!shopName || !ownerName || !email || !phone) {
       return res.status(400).json({ success: false, message: "Missing required fields" });
     }
 
-    // 2. Email duplication check
     const existing = await Shop.findOne({ email: email.toLowerCase().trim() });
     if (existing) {
-      return res.status(400).json({ success: false, message: "Email already exists" });
+      return res.status(400).json({ success: false, message: "Email already registered" });
     }
 
-    const randomNum = Math.floor(1000 + Math.random() * 9000);
-    const loginId = `SHOP${randomNum}`;
-    const rawPass = `${shopName.slice(0, 4).toUpperCase()}@${randomNum}`;
-
-    // Hash password for Shop model
+    const randomNum  = Math.floor(1000 + Math.random() * 9000);
+    const loginId    = `SHOP${randomNum}`;
+    const rawPass    = `${shopName.slice(0, 4).toUpperCase()}@${randomNum}`;
     const hashedPass = await bcrypt.hash(rawPass, 10);
+    const encPass    = encryptPassword(rawPass);
 
-    // 3. Create Shop
+    // ── Shop create karo ──────────────────────────────────────────────────────
     const shop = await Shop.create({
-      shopName,
-      ownerName,
-      email: email.toLowerCase().trim(),
-      phone,
-      address,
-      gstNo,
+      shopName:    shopName.trim(),
+      ownerName:   ownerName.trim(),
+      email:       email.toLowerCase().trim(),
+      phone:       phone.trim(),
+      address:     address?.trim()  || "",
+      gstNo:       gstNo?.trim().toUpperCase() || "",
       loginId,
-      password: hashedPass,
+      password:    hashedPass,  // bcrypt hash
+      rawPassword: encPass,     // AES encrypted — reveal ke liye
     });
 
-    // 4. Create Admin User for this shop
-    // Make sure 'User' model is imported correctly at the top
+    // ── Admin User create karo ────────────────────────────────────────────────
+    // ✅ rawPass direct do — UserStocks pre-save hook khud hash karega
+    // ❌ Kabhi hashedPass mat do — double hashing ho jaayegi
     await User.create({
-      name: ownerName,
-      email: email.toLowerCase().trim(),
-      password: rawPass, // Pre-save hook will hash this
-      role: "admin",
-      shopId: shop._id,
+      name:     ownerName.trim(),
+      email:    email.toLowerCase().trim(),
+      password: rawPass,   // plain text — hook hash karega
+      role:     "admin",
+      shopId:   shop._id,
     });
 
     res.status(201).json({
       success: true,
       credentials: { loginId, password: rawPass },
-      shop: { shopName: shop.shopName, email: shop.email }  // ← yeh add karo
+      shop: { shopName: shop.shopName, email: shop.email },
     });
 
   } catch (error) {
-    console.error("DETAILED ERROR:", error); // Yeh terminal mein error dikhayega
+    console.error("CREATE SHOP ERROR:", error);
     res.status(500).json({ success: false, message: error.message });
   }
 };
 
-// ✅ Saari shops
+// ── Get All Shops ─────────────────────────────────────────────────────────────
 exports.getAllShops = async (req, res) => {
   try {
-    const shops = await Shop.find().select("-password").sort({ createdAt: -1 });
+    const shops = await Shop
+      .find()
+      .select("-password -rawPassword")
+      .sort({ createdAt: -1 });
     res.status(200).json({ success: true, count: shops.length, shops });
   } catch (error) {
     res.status(500).json({ success: false, message: "Server error" });
   }
 };
 
-// ✅ Single shop
+// ── Get Single Shop ───────────────────────────────────────────────────────────
 exports.getShopById = async (req, res) => {
   try {
-    const shop = await Shop.findById(req.params.id).select("-password");
-    if (!shop) {
-      return res.status(404).json({ success: false, message: "Shop nahi mili" });
-    }
+    const shop = await Shop.findById(req.params.id).select("-password -rawPassword");
+    if (!shop) return res.status(404).json({ success: false, message: "Shop not found" });
     res.status(200).json({ success: true, shop });
   } catch (error) {
     res.status(500).json({ success: false, message: "Server error" });
   }
 };
 
-// ✅ Activate / Deactivate
+// ── Toggle Active / Inactive ──────────────────────────────────────────────────
 exports.toggleShopStatus = async (req, res) => {
   try {
     const shop = await Shop.findById(req.params.id);
-    if (!shop) {
-      return res.status(404).json({ success: false, message: "Shop nahi mili" });
-    }
+    if (!shop) return res.status(404).json({ success: false, message: "Shop not found" });
+
     shop.isActive = !shop.isActive;
     await shop.save();
 
     res.status(200).json({
-      success: true,
-      message: `Shop ${shop.isActive ? "activate" : "deactivate"} ho gayi`,
+      success:  true,
+      message:  `Shop ${shop.isActive ? "activated" : "deactivated"}`,
       isActive: shop.isActive,
     });
   } catch (error) {
