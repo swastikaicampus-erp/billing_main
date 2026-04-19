@@ -51,6 +51,7 @@ app.use("/api/payments", require("./routes/paymentRoutes"));
 app.use("/api/expenses", require("./routes/expenseRoutes"));
 app.use("/api/staff", require("./routes/staffRoutes"));
 app.use("/api/people", require("./routes/peopleRoutes"));
+app.use("/api/metal-rates", require("./routes/metalRatesRoute"));
 
 // --- Database & Server ---
 const MONGO_URI = process.env.MONGO_URI;
