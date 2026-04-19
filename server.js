@@ -9,8 +9,10 @@ const app = express();
 // --- CORS Setup ---
 const allowedOrigins = [
   "http://localhost:5173",
+  "http://localhost:5174", 
   "http://localhost:3000",
-  "https://gbbilling-ae817.web.app",   // ← hardcode bhi rakho backup ke liye
+  "https://gbbilling-ae817.web.app",
+  "https://goldberry-259f6.web.app",   // ← hardcode bhi rakho backup ke liye
   process.env.FRONTEND_URL,
 ];
 
